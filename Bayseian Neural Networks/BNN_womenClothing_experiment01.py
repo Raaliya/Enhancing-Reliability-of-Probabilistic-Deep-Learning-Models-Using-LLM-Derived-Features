@@ -7,8 +7,6 @@ Expected input file (by default, in the same directory as this script):
     women_clothing_reviews.csv
 """
 
-from __future__ import annotations
-
 import os
 import random
 from pathlib import Path
