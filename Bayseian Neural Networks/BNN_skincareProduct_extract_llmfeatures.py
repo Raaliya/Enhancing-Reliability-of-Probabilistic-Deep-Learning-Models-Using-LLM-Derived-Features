@@ -1,9 +1,25 @@
 
+"""
+Skincare Product Reviews
+LLM-Derived Thematic Feature Extraction
+
+resence-polarity-intensity implementation.
+
+Five skincare-related themes are encoded using:
+    Presence:  0 = absent, 1 = present
+    Polarity: -1 = negative, 0 = neutral/mixed, 1 = positive
+    Intensity: 0 = absent, 1 = mild, 2 = moderate, 3 = strong
+
+
+Five predefined themes generate 15 thematic features
+
+"""
+
 import os
 import json
-import re
+import time
+import hashlib
 import pandas as pd
-import numpy as np
 import requests
 from tqdm import tqdm
 
@@ -19,182 +35,419 @@ INPUT_PATH = os.path.join(
     ROOT, "data_subsets", INPUT_FILENAME
 )
 
-OUTPUT_FILENAME = INPUT_FILENAME.replace(
-    ".csv", "_llm.csv"
+OUTPUT_DIR = os.path.join(
+    ROOT, "data_subsets", "skincare_llm_15features"
 )
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 OUTPUT_PATH = os.path.join(
-    ROOT, "data_subsets", OUTPUT_FILENAME
+    OUTPUT_DIR,
+    "skincare_2000_seed42_llm_15features.csv"
 )
 
-RAW_LOG_PATH = os.path.join(
-    ROOT, "data_subsets", "llm_raw_outputs_log.jsonl"
+CACHE_PATH = os.path.join(
+    OUTPUT_DIR, "llm_cache.jsonl"
 )
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+ERROR_PATH = os.path.join(
+    OUTPUT_DIR, "extraction_errors.jsonl"
+)
 
+CHECKPOINT_PATH = os.path.join(
+    OUTPUT_DIR, "checkpoint_partial.csv"
+)
+
+TEXT_COLUMN = "review_text"
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.1:latest"
 
-# ============================================================
-# TEXT COLUMN
-# Only review_text will be used for LLM feature extraction
-# ============================================================
-
-TEXT_CANDIDATES = [
-    "review_text"
-]
-
+MAX_ROWS = 2000
 MAX_CHARS = 1000
 
+TEMPERATURE = 0.0
+TIMEOUT = 180
+MAX_RETRIES = 3
+SAVE_EVERY = 25
+
 # ============================================================
-# LLM-DERIVED FEATURES
+# FIXED DEDUCTIVE THEMATIC CODEBOOK
 # ============================================================
 
-FEATURES = [
-    "llm_sentiment",
-    "llm_product_quality",
-    "llm_value_for_money",
-    "llm_skin_suitability",
-    "llm_ingredient_concern"
+THEMES = {
+    "sentiment":
+        "Overall positive or negative experience with the "
+        "skincare product.",
+
+    "product_quality":
+        "Perceived product quality, effectiveness, texture, "
+        "consistency or performance.",
+
+    "value_for_money":
+        "Perceived price fairness, affordability or value "
+        "relative to product performance.",
+
+    "skin_suitability":
+        "Suitability for the reviewer's skin, including "
+        "beneficial effects, irritation or adverse reactions.",
+
+    "ingredient_concern":
+        "Explicit discussion of product ingredients, "
+        "including concerns, safety or perceived benefits."
+}
+
+DIMENSIONS = (
+    "present",
+    "polarity",
+    "intensity"
+)
+
+FEATURE_COLUMNS = [
+    f"llm_{theme}_{dimension}"
+    for theme in THEMES
+    for dimension in DIMENSIONS
 ]
 
 # ============================================================
 # PROMPT
 # ============================================================
 
-def prompt_for(text):
+SYSTEM_PROMPT = f"""
+You are a qualitative researcher performing deductive
+thematic coding of skincare product reviews.
 
-    return f"""
-You are a skincare product evaluation expert.
+Use ONLY the fixed thematic codebook below.
 
-Based ONLY on the text below, estimate the following scores:
+For each theme, extract three numerical features.
 
-- llm_sentiment:
-  0 = very negative
-  1 = very positive
+PRESENCE:
+0 = theme absent
+1 = theme present
 
-- llm_product_quality:
-  0 = very poor quality
-  5 = excellent quality
+POLARITY:
+-1 = negative
+ 0 = neutral, mixed or unclear
+ 1 = positive
 
-- llm_value_for_money:
-  0 = extremely overpriced
-  5 = excellent value
+INTENSITY:
+0 = theme absent
+1 = mild
+2 = moderate
+3 = strong
 
-- llm_skin_suitability:
-  0 = likely harmful or unsuitable
-  5 = highly suitable and beneficial
+CODING RULES:
 
-- llm_ingredient_concern:
-  0 = no concerning ingredients
-  5 = highly concerning ingredients
+1. Use only information supported by the review text.
+2. Do not infer product properties that are not mentioned.
+3. Evaluate each theme independently.
+4. If a theme is absent:
+   present = 0
+   polarity = 0
+   intensity = 0
+5. If a theme is present:
+   present = 1
+   intensity must be 1, 2 or 3.
+6. Neutral or mixed sentiment should have polarity = 0.
+7. For ingredient_concern, negative polarity indicates
+   an unfavourable ingredient-related experience or concern;
+   positive polarity indicates a favourable ingredient-related
+   experience or assessment.
+8. Do not infer ingredient safety from ingredient names alone.
+9. Return valid JSON only.
+10. Do not include Markdown or explanations.
 
-Return ONLY valid JSON.
-No explanation.
+FIXED CODEBOOK:
+{json.dumps(THEMES, indent=2)}
 
-TEXT:
-{text}
+REQUIRED JSON STRUCTURE:
+
+{{
+  "themes": {{
+    "sentiment": {{
+      "present": 0,
+      "polarity": 0,
+      "intensity": 0
+    }},
+    "product_quality": {{
+      "present": 0,
+      "polarity": 0,
+      "intensity": 0
+    }},
+    "value_for_money": {{
+      "present": 0,
+      "polarity": 0,
+      "intensity": 0
+    }},
+    "skin_suitability": {{
+      "present": 0,
+      "polarity": 0,
+      "intensity": 0
+    }},
+    "ingredient_concern": {{
+      "present": 0,
+      "polarity": 0,
+      "intensity": 0
+    }}
+  }}
+}}
+
+Return exactly these five themes.
 """.strip()
-
 
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 
-def pick_text_column(df):
+def append_jsonl(path, record):
 
-    # Only the review_text column is permitted
-    if "review_text" not in df.columns:
+    with open(path, "a", encoding="utf-8") as file:
+        file.write(
+            json.dumps(
+                record,
+                ensure_ascii=False
+            ) + "\n"
+        )
 
+
+def text_hash(text):
+
+    return hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
+
+
+def load_cache(path):
+
+    cache = {}
+
+    if os.path.exists(path):
+
+        with open(path, "r", encoding="utf-8") as file:
+
+            for line in file:
+
+                try:
+                    record = json.loads(line)
+                    cache[record["key"]] = record["value"]
+
+                except (ValueError, KeyError):
+                    continue
+
+    return cache
+
+
+def zero_schema():
+
+    return {
+        "themes": {
+            theme: {
+                "present": 0,
+                "polarity": 0,
+                "intensity": 0
+            }
+            for theme in THEMES
+        }
+    }
+
+
+# ============================================================
+# VALIDATE EXTRACTED FEATURES
+# ============================================================
+
+def validate_output(parsed):
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object.")
+
+    if set(parsed.keys()) != {"themes"}:
         raise ValueError(
-            "Column 'review_text' not found in dataset."
+            "Unexpected top-level JSON keys."
         )
 
-    return "review_text"
+    themes = parsed["themes"]
 
-
-def extract_json(text):
-
-    match = re.search(
-        r"\{.*\}",
-        text.strip(),
-        flags=re.S
-    )
-
-    if not match:
-
+    if not isinstance(themes, dict):
         raise ValueError(
-            "No JSON found in LLM response."
+            "The 'themes' value must be a JSON object."
         )
 
-    return json.loads(
-        match.group(0)
-    )
-
-
-def coerce_features(d):
-
-    out = {}
-
-    for k in FEATURES:
-
-        v = d.get(k, 0)
-
-        try:
-            v = float(v)
-
-        except Exception:
-            v = 0.0
-
-        out[k] = v
-
-    # Clip sentiment to 0-1
-    out["llm_sentiment"] = float(
-        np.clip(
-            out["llm_sentiment"],
-            0.0,
-            1.0
+    if set(themes.keys()) != set(THEMES.keys()):
+        raise ValueError(
+            "Missing or unexpected theme names."
         )
-    )
 
-    # Clip remaining features to 0-5
-    for k in FEATURES:
+    validated = {"themes": {}}
 
-        if k != "llm_sentiment":
+    for theme in THEMES:
 
-            out[k] = float(
-                np.clip(
-                    out[k],
-                    0.0,
-                    5.0
-                )
+        values = themes[theme]
+
+        if not isinstance(values, dict):
+            raise ValueError(
+                f"Invalid theme structure: {theme}"
             )
 
-    return out
+        required = {
+            "present",
+            "polarity",
+            "intensity"
+        }
+
+        if set(values.keys()) != required:
+            raise ValueError(
+                f"Invalid feature keys for {theme}"
+            )
+
+        present = values["present"]
+        polarity = values["polarity"]
+        intensity = values["intensity"]
+
+        for value in (
+            present,
+            polarity,
+            intensity
+        ):
+            if type(value) is not int:
+                raise ValueError(
+                    f"Non-integer value for {theme}"
+                )
+
+        if present not in (0, 1):
+            raise ValueError(
+                f"Invalid presence for {theme}"
+            )
+
+        if polarity not in (-1, 0, 1):
+            raise ValueError(
+                f"Invalid polarity for {theme}"
+            )
+
+        if intensity not in (0, 1, 2, 3):
+            raise ValueError(
+                f"Invalid intensity for {theme}"
+            )
+
+        if present == 0:
+
+            if polarity != 0 or intensity != 0:
+                raise ValueError(
+                    f"Inconsistent absent theme: {theme}"
+                )
+
+        if present == 1 and intensity == 0:
+            raise ValueError(
+                f"Present theme has zero intensity: {theme}"
+            )
+
+        validated["themes"][theme] = {
+            "present": present,
+            "polarity": polarity,
+            "intensity": intensity
+        }
+
+    return validated
 
 
-def call_ollama(prompt):
+# ============================================================
+# FLATTEN FEATURES INTO DATASET COLUMNS
+# ============================================================
+
+def flatten_features(codes):
+
+    features = {}
+
+    for theme, values in codes["themes"].items():
+
+        features[
+            f"llm_{theme}_present"
+        ] = values["present"]
+
+        features[
+            f"llm_{theme}_polarity"
+        ] = values["polarity"]
+
+        features[
+            f"llm_{theme}_intensity"
+        ] = values["intensity"]
+
+    return features
+
+
+# ============================================================
+# OLLAMA REQUEST
+# ============================================================
+
+def call_ollama(text):
 
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": prompt,
         "stream": False,
+        "format": "json",
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"REVIEW TEXT:\n{text}"
+            }
+        ],
         "options": {
-            "temperature": 0.0
+            "temperature": TEMPERATURE
         }
     }
 
     response = requests.post(
         OLLAMA_URL,
         json=payload,
-        timeout=120
+        timeout=TIMEOUT
     )
 
     response.raise_for_status()
 
-    return response.json().get(
-        "response", ""
-    )
+    result = response.json()
+
+    content = result["message"]["content"]
+
+    return json.loads(content)
+
+
+# ============================================================
+# EXTRACT FEATURES WITH RETRY
+# ============================================================
+
+def extract_features(text):
+
+    if not text.strip():
+        return zero_schema(), True, "empty_text"
+
+    last_error = ""
+
+    for attempt in range(MAX_RETRIES):
+
+        try:
+
+            parsed = call_ollama(text)
+
+            validated = validate_output(parsed)
+
+            return validated, True, ""
+
+        except Exception as error:
+
+            last_error = (
+                f"{type(error).__name__}: {error}"
+            )
+
+            if attempt < MAX_RETRIES - 1:
+
+                time.sleep(
+                    2 * (attempt + 1)
+                )
+
+    return zero_schema(), False, last_error
 
 
 # ============================================================
@@ -204,174 +457,243 @@ def call_ollama(prompt):
 def main():
 
     # --------------------------------------------------------
-    # CHECK INPUT FILE
+    # LOAD INPUT DATASET
     # --------------------------------------------------------
 
     if not os.path.exists(INPUT_PATH):
 
         raise FileNotFoundError(
-            f"Input file not found:\n{INPUT_PATH}"
+            f"Input file not found: {INPUT_PATH}"
+        )
+
+    df = pd.read_csv(
+        INPUT_PATH,
+        low_memory=False
+    )
+
+    # --------------------------------------------------------
+    # VERIFY TEXT COLUMN
+    # --------------------------------------------------------
+
+    if TEXT_COLUMN not in df.columns:
+
+        raise ValueError(
+            f"Required text column '{TEXT_COLUMN}' "
+            "not found in dataset."
         )
 
     # --------------------------------------------------------
-    # LOAD DATASET
+    # SELECT ROWS
     # --------------------------------------------------------
 
-    df = pd.read_csv(INPUT_PATH)
+    df = df.head(
+        MAX_ROWS
+    ).copy().reset_index(drop=True)
 
-    print("Dataset loaded:", df.shape)
-
-    # --------------------------------------------------------
-    # SELECT TEXT COLUMN
-    # --------------------------------------------------------
-
-    text_col = pick_text_column(df)
-
-    print("Using text column:", text_col)
+    cache = load_cache(CACHE_PATH)
 
     # --------------------------------------------------------
-    # RESET RAW LOG
+    # RESUME FROM CHECKPOINT
     # --------------------------------------------------------
 
-    if os.path.exists(RAW_LOG_PATH):
+    if os.path.exists(CHECKPOINT_PATH):
 
-        os.remove(RAW_LOG_PATH)
+        previous = pd.read_csv(
+            CHECKPOINT_PATH
+        )
 
-    # --------------------------------------------------------
-    # INITIALISE FEATURE STORAGE
-    # --------------------------------------------------------
+        if len(previous) > len(df):
+            raise ValueError(
+                "Checkpoint contains too many rows."
+            )
 
-    features_dict = {
-        k: [] for k in FEATURES
-    }
+        if len(previous) > 0:
 
-    failures = 0
+            expected = list(
+                range(len(previous))
+            )
 
-    # --------------------------------------------------------
-    # LLM FEATURE EXTRACTION
-    # --------------------------------------------------------
+            actual = previous[
+                "row_index"
+            ].tolist()
 
-    with open(
-        RAW_LOG_PATH,
-        "w",
-        encoding="utf-8"
-    ) as raw_file:
-
-        for i, row in tqdm(
-            df.iterrows(),
-            total=len(df)
-        ):
-
-            # Use only review_text
-            text = str(
-                row.get(text_col, "")
-            ).replace(
-                "\n", " "
-            ).strip()
-
-            # Limit text length
-            if len(text) > MAX_CHARS:
-
-                text = text[:MAX_CHARS]
-
-            # Generate prompt
-            prompt = prompt_for(text)
-
-            try:
-
-                # Call Llama 3.1 through Ollama
-                response = call_ollama(prompt)
-
-                # Save raw LLM response
-                raw_file.write(
-                    json.dumps(
-                        {
-                            "i": int(i),
-                            "response": response
-                        },
-                        ensure_ascii=False
-                    ) + "\n"
+            if actual != expected:
+                raise ValueError(
+                    "Checkpoint row indices do not match."
                 )
 
-                # Extract JSON and convert scores
-                parsed = coerce_features(
-                    extract_json(response)
+        results = previous.to_dict("records")
+
+        start = len(results)
+
+    else:
+
+        results = []
+
+        start = 0
+
+    # --------------------------------------------------------
+    # EXTRACTION SUMMARY
+    # --------------------------------------------------------
+
+    print("=" * 65)
+    print("SKINCARE LLM FEATURE EXTRACTION")
+    print("=" * 65)
+
+    print("Input:", INPUT_PATH)
+    print("Text column:", TEXT_COLUMN)
+    print("LLM:", OLLAMA_MODEL)
+    print("Themes:", len(THEMES))
+    print("Features:", len(FEATURE_COLUMNS))
+    print("Rows:", len(df))
+    print("Starting row:", start)
+
+    # --------------------------------------------------------
+    # PROCESS EACH REVIEW
+    # --------------------------------------------------------
+
+    for i in tqdm(
+        range(start, len(df)),
+        initial=start,
+        total=len(df),
+        desc="LLM thematic coding"
+    ):
+
+        raw_text = df.at[
+            i,
+            TEXT_COLUMN
+        ]
+
+        text = (
+            ""
+            if pd.isna(raw_text)
+            else str(raw_text).strip()
+        )
+
+        text = text[:MAX_CHARS]
+
+        key = text_hash(text)
+
+        if key in cache:
+
+            codes = cache[key]
+
+            success = True
+
+            error = ""
+
+        else:
+
+            codes, success, error = extract_features(text)
+
+            if success:
+
+                append_jsonl(
+                    CACHE_PATH,
+                    {
+                        "key": key,
+                        "value": codes
+                    }
                 )
 
-                # Store extracted feature values
-                for k in FEATURES:
+                cache[key] = codes
 
-                    features_dict[k].append(
-                        parsed[k]
-                    )
+        # ----------------------------------------------------
+        # LOG FAILURES
+        # ----------------------------------------------------
 
-            except Exception as e:
+        if not success:
 
-                failures += 1
+            append_jsonl(
+                ERROR_PATH,
+                {
+                    "row_index": i,
+                    "error": error
+                }
+            )
 
-                # Log extraction error
-                raw_file.write(
-                    json.dumps(
-                        {
-                            "i": int(i),
-                            "error": str(e)
-                        },
-                        ensure_ascii=False
-                    ) + "\n"
-                )
+        # ----------------------------------------------------
+        # STORE FEATURES
+        # ----------------------------------------------------
 
-                # Preserve original failure handling
-                for k in FEATURES:
+        features = flatten_features(codes)
 
-                    features_dict[k].append(
-                        0.0
-                    )
+        results.append({
+            "row_index": i,
+            **features,
+            "extraction_success": int(success),
+            "extraction_error": error
+        })
+
+        # ----------------------------------------------------
+        # SAVE CHECKPOINT
+        # ----------------------------------------------------
+
+        if (i + 1) % SAVE_EVERY == 0:
+
+            pd.DataFrame(results).to_csv(
+                CHECKPOINT_PATH,
+                index=False
+            )
 
     # ========================================================
-    # ADD LLM FEATURES TO DATASET
+    # CREATE ENRICHED DATASET
     # ========================================================
 
-    for k in FEATURES:
+    features_df = pd.DataFrame(results)
 
-        df[k] = features_dict[k]
+    # Exclude row_index from duplicated columns
+    feature_values = features_df[
+        FEATURE_COLUMNS + [
+            "extraction_success",
+            "extraction_error"
+        ]
+    ].copy()
+
+    enriched_df = pd.concat(
+        [
+            df.reset_index(drop=True),
+            feature_values.reset_index(drop=True)
+        ],
+        axis=1
+    )
 
     # ========================================================
-    # SAVE ENRICHED DATASET
+    # SAVE OUTPUT
     # ========================================================
 
-    df.to_csv(
+    enriched_df.to_csv(
         OUTPUT_PATH,
         index=False
     )
 
+    features_df.to_csv(
+        CHECKPOINT_PATH,
+        index=False
+    )
+
     # ========================================================
-    # EXTRACTION SUMMARY
+    # FINAL SUMMARY
     # ========================================================
 
-    print("\n==========================================")
-    print("Extraction Completed")
-    print("Output saved to:", OUTPUT_PATH)
-    print(
-        "Failures:",
-        failures,
-        "out of",
-        len(df)
-    )
-    print("==========================================")
-
-    print("\nFeature Summary:")
-
-    print(
-        df[FEATURES]
-        .describe()
-        .T[["min", "max", "mean"]]
+    failures = int(
+        (features_df["extraction_success"] == 0).sum()
     )
 
-    print("\nNon-zero counts:")
+    print("\n" + "=" * 65)
+    print("EXTRACTION COMPLETED")
+    print("=" * 65)
 
-    print(
-        (df[FEATURES] != 0).sum()
-    )
+    print("Output:", OUTPUT_PATH)
+    print("Rows:", len(enriched_df))
+    print("Themes:", len(THEMES))
+    print("LLM-derived features:", len(FEATURE_COLUMNS))
+    print("Failed extractions:", failures)
+
+    print("\nExtracted feature columns:")
+
+    for feature in FEATURE_COLUMNS:
+        print(feature)
 
 
 if __name__ == "__main__":
