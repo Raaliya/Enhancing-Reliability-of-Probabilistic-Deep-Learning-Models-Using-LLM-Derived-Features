@@ -1,20 +1,3 @@
-"""Extract stress-related LLM features for BNN Experiment 02.
-
-Important: feature extraction is model-independent. The CSV produced by this
-script can also be reused for Monte Carlo Dropout and Deep Ensemble models so
-that all downstream models receive exactly the same rows and LLM features.
-
-The script:
-* processes at most the first 2,000 rows;
-* uses a fixed deductive codebook;
-* appends one processed row at a time;
-* resumes from an atomic JSON checkpoint after interruption;
-* retries temporary Ollama failures;
-* records whether extraction succeeded for each row.
-"""
-
-
-
 import json
 import os
 import time
