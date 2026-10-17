@@ -1,20 +1,3 @@
-
-"""
-Skincare Product Reviews
-LLM-Derived Thematic Feature Extraction
-
-resence-polarity-intensity implementation.
-
-Five skincare-related themes are encoded using:
-    Presence:  0 = absent, 1 = present
-    Polarity: -1 = negative, 0 = neutral/mixed, 1 = positive
-    Intensity: 0 = absent, 1 = mild, 2 = moderate, 3 = strong
-
-
-Five predefined themes generate 15 thematic features
-
-"""
-
 import os
 import json
 import time
