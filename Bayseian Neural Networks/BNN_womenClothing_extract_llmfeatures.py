@@ -21,7 +21,7 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:latest")
 
 N_ROWS = 2000
 RANDOM_STATE = 42
-MAX_CHARS = 300
+MAX_CHARS = 1000
 TEMPERATURE = 0.0
 NUM_PREDICT = 220
 TIMEOUT = (10, 600)   # connect, read
