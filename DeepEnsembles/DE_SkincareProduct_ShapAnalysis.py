@@ -2,7 +2,7 @@
 # SHAP Explanation for Skincare Dataset - Deep Ensembles Model
 # Generates: Bar Plot, Beeswarm Plot, Waterfall Plot, Combined Figure
 # Original features + best 15 LLM-derived features
-# is_recommended is fully excluded from display and model features
+# 
 # ============================================================
 
 import os
